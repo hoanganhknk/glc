@@ -6,17 +6,14 @@ import time
 import math
 import json
 import torch
-from torch.autograd import Variable as V
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
-import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import wideresnet as wrn
 import numpy as np
 from load_corrupted_data import CIFAR10, CIFAR100
 from PIL import Image
 import socket
-
 
 # note: nosgdr, schedule, and epochs are highly related settings
 
@@ -59,8 +56,8 @@ parser.add_argument('--log', type=str, default='./', help='Log folder.')
 parser.add_argument('--seed', type=int, default=1)
 args = parser.parse_args()
 
-
 np.random.seed(args.seed)
+torch.manual_seed(args.seed)
 
 print()
 print("This is on machine:", socket.gethostname())
@@ -68,9 +65,12 @@ print()
 print(args)
 print()
 
+# Device
+use_cuda = args.ngpu > 0 and torch.cuda.is_available()
+device = torch.device('cuda' if use_cuda else 'cpu')
+
 # Init logger
-if not os.path.isdir(args.log):
-    os.makedirs(args.log)
+os.makedirs(args.log, exist_ok=True)
 log = open(os.path.join(args.log, args.dataset + '_log.txt'), 'w')
 state = {k: v for k, v in args._get_kwargs()}
 state['tt'] = 0      # SGDR variable
@@ -78,8 +78,7 @@ state['init_learning_rate'] = args.learning_rate
 log.write(json.dumps(state) + '\n')
 
 # Init dataset
-if not os.path.isdir(args.data_path):
-    os.makedirs(args.data_path)
+os.makedirs(args.data_path, exist_ok=True)
 
 mean = [x / 255 for x in [125.3, 123.0, 113.9]]
 std = [x / 255 for x in [63.0, 62.1, 66.7]]
@@ -126,87 +125,84 @@ class Dataset(object):
 
 class TensorDataset(Dataset):
     def __init__(self, data_tensor, target_tensor, transform):
-        # assert data_tensor.size(0) == target_tensor.size(0)
+        # data_tensor: numpy array (N, H, W, C)
+        # target_tensor: torch.LongTensor (N,)
         self.data_tensor = data_tensor
         self.target_tensor = target_tensor
         self.transform = transform
 
     def __getitem__(self, index):
-        img, target = self.data_tensor[index], self.target_tensor[index]
-
+        img, target = self.data_tensor[index], self.target_tensor[index].item()
         img = Image.fromarray(img)
-
         if self.transform is not None:
-            img = self.transform(img)
-
-        return img, target
+            img = self.transform(img)  # tensor (C,H,W)
+        return img, target  # target as int for cleaner collation
 
     def __len__(self):
         return 50000
 
+pin_memory = use_cuda
 train_silver_loader = torch.utils.data.DataLoader(
     train_data_silver, batch_size=args.batch_size, shuffle=True,
-    num_workers=args.prefetch, pin_memory=True)
+    num_workers=args.prefetch, pin_memory=pin_memory)
 train_gold_deterministic_loader = torch.utils.data.DataLoader(
     train_data_gold_deterministic, batch_size=args.test_bs, shuffle=False,
-    num_workers=args.prefetch, pin_memory=True)
+    num_workers=args.prefetch, pin_memory=pin_memory)
 train_all_loader = torch.utils.data.DataLoader(
     TensorDataset(np.vstack((train_data_gold.train_data, train_data_silver.train_data)),
-                  torch.from_numpy(np.array(train_data_gold.train_labels + train_data_silver.train_labels)),
+                  torch.from_numpy(np.array(train_data_gold.train_labels + train_data_silver.train_labels)).long(),
                   train_transform),
     batch_size=args.batch_size, shuffle=True,
-    num_workers=args.prefetch, pin_memory=True)
-test_loader = torch.utils.data.DataLoader(test_data, batch_size=args.test_bs, shuffle=False,
-                                          num_workers=args.prefetch, pin_memory=True)
+    num_workers=args.prefetch, pin_memory=pin_memory)
+test_loader = torch.utils.data.DataLoader(
+    test_data, batch_size=args.test_bs, shuffle=False,
+    num_workers=args.prefetch, pin_memory=pin_memory)
 
 # Init checkpoints
-if not os.path.isdir(args.save):
-    os.makedirs(args.save)
+os.makedirs(args.save, exist_ok=True)
 
 # Init model, criterion, and optimizer
 net = wrn.WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate)
 print(net)
 
-if args.ngpu > 1:
+if use_cuda and args.ngpu > 1:
     net = torch.nn.DataParallel(net, device_ids=list(range(args.ngpu)))
 
-if args.ngpu > 0:
-    net.cuda()
+net = net.to(device)
 
-torch.manual_seed(args.seed)
-if args.ngpu > 0:
+if use_cuda:
     torch.cuda.manual_seed(args.seed)
 
-
-optimizer = torch.optim.SGD(net.parameters(), state['learning_rate'], momentum=state['momentum'],
-                            weight_decay=state['decay'], nesterov=True)
+optimizer = torch.optim.SGD(net.parameters(), state['init_learning_rate'],
+                            momentum=args.momentum, weight_decay=args.decay, nesterov=True)
 
 # saving so we can start again from these same weights when applying the correction
-torch.save(net.state_dict(), os.path.join(
-    args.save, args.dataset+'_'+str(args.gold_fraction) + str(args.corruption_prob) + args.corruption_type + '_init.pytorch'))
+init_model_path = os.path.join(
+    args.save, f"{args.dataset}_{args.gold_fraction}{args.corruption_prob}{args.corruption_type}_init.pytorch")
+torch.save(net.state_dict(), init_model_path)
 
-# Restore model
+# Restore model (optional)
 start_epoch = 0
 # if args.load != '':
 #     for i in range(args.epochs-1,-1,-1):
 #         model_name = os.path.join(args.load, args.dataset + '_model_epoch' + str(i) + '.pytorch')
 #         if os.path.isfile(model_name):
-#             net.load_state_dict(torch.load(model_name))
+#             net.load_state_dict(torch.load(model_name, map_location=device))
 #             start_epoch = i+1
 #             print('Model restored! Epoch:', i)
 #             break
 #     if start_epoch == 0:
-#         assert False, "could not resume"
+#         raise RuntimeError("could not resume")
 
-
-cudnn.benchmark = True  # fire on all cylinders
-
+if use_cuda:
+    cudnn.benchmark = True  # fire on all cylinders
 
 def train_phase1():
-    net.train()     # enter train mode
+    net.train()
     loss_avg = 0.0
     for batch_idx, (data, target) in enumerate(train_silver_loader):
-        data, target = V(data.cuda()), V(target.cuda())
+        data = data.to(device)
+        target = target.to(device)
 
         # forward
         output = net(data)
@@ -218,56 +214,59 @@ def train_phase1():
         optimizer.step()
 
         # exponential moving average
-        loss_avg = loss_avg * 0.8 + loss.data[0] * 0.2
+        loss_avg = loss_avg * 0.8 + loss.item() * 0.2
 
-        if args.nosgdr is False:    # Use a cyclic learning rate
-            dt = math.pi/float(args.epochs)
-            state['tt'] += float(dt)/(len(train_silver_loader.dataset)/float(args.batch_size))
+        # cyclic learning rate (SGDR-like)
+        if not args.nosgdr:
+            dt = math.pi / float(args.epochs)
+            state['tt'] += float(dt) / (len(train_silver_loader.dataset) / float(args.batch_size))
             if state['tt'] >= math.pi - 0.05:
                 state['tt'] = math.pi - 0.05
             curT = math.pi/2.0 + state['tt']
-            new_lr = args.learning_rate * (1.0 + math.sin(curT))/2.0    # lr_min = 0, lr_max = lr
+            new_lr = args.learning_rate * (1.0 + math.sin(curT)) / 2.0  # lr_min = 0, lr_max = lr
             state['learning_rate'] = new_lr
             for param_group in optimizer.param_groups:
                 param_group['lr'] = state['learning_rate']
 
     state['train_loss'] = loss_avg
 
-
-# test function (forward only)
+@torch.no_grad()
 def test():
     net.eval()
     loss_avg = 0.0
     correct = 0
+    total = 0
     for batch_idx, (data, target) in enumerate(test_loader):
-        data, target = V(data.cuda(), volatile=True),\
-                       V(target.cuda(), volatile=True)
+        data = data.to(device)
+        target = target.to(device)
 
         # forward
         output = net(data)
         loss = F.cross_entropy(output, target)
 
         # accuracy
-        pred = output.data.max(1)[1]
-        correct += pred.eq(target.data).sum()
+        pred = output.argmax(1)
+        correct += pred.eq(target).sum().item()
+        total += target.size(0)
 
         # test loss average
-        loss_avg += loss.data[0]
+        loss_avg += loss.item()
 
     state['test_loss'] = loss_avg / len(test_loader)
-    state['test_accuracy'] = correct / len(test_loader.dataset)
+    state['test_accuracy'] = correct / float(total)
 
-
-# Main loop
+# Main loop phase 1
 for epoch in range(start_epoch, args.epochs):
+    # If you want step schedule instead of SGDR, uncomment this block:
     # if epoch < 150:
     #     state['learning_rate'] = state['init_learning_rate']
-    # elif epoch >= 150 and epoch < 225:
+    # elif epoch < 225:
     #     state['learning_rate'] = state['init_learning_rate'] * args.gamma
-    # elif epoch >= 225:
+    # else:
     #     state['learning_rate'] = state['init_learning_rate'] * (args.gamma ** 2)
     # for param_group in optimizer.param_groups:
     #     param_group['lr'] = state['learning_rate']
+
     state['epoch'] = epoch
 
     begin_epoch = time.time()
@@ -277,44 +276,39 @@ for epoch in range(start_epoch, args.epochs):
     test()
 
     # torch.save(net.state_dict(), os.path.join(args.save, args.dataset + '_model_epoch' + str(epoch) + '.pytorch'))
-    # Let us not waste space and delete the previous model
-    # We do not overwrite the model because we need the epoch number
-    # try: os.remove(os.path.join(args.save, args.dataset + '_model_epoch' + str(epoch-1) + '.pytorch'))
-    # except: True    # prodigious programming form
-
     log.write('%s\n' % json.dumps(state))
     log.flush()
     print(state)
 
-
 print('\nNow retraining with correction\n')
 
-
+@torch.no_grad()
 def get_C_hat_transpose():
     probs = []
     net.eval()
     for batch_idx, (data, target) in enumerate(train_gold_deterministic_loader):
-        # we subtract 10 because we added 10 to gold so we could identify which example is gold in train_phase2
-        data, target = V(data.cuda(), volatile=True),\
-                       V((target - num_classes).cuda(), volatile=True)
+        data = data.to(device)
+        # we subtract num_classes because we added num_classes to gold so we could identify which example is gold
+        target = (target.to(device) - num_classes)
 
-        # forward
         output = net(data)
-        pred = F.softmax(output)
-        probs.extend(list(pred.data.cpu().numpy()))
+        pred = F.softmax(output, dim=1)
+        probs.extend(list(pred.detach().cpu().numpy()))
 
     probs = np.array(probs, dtype=np.float32)
-    C_hat = np.zeros((num_classes, num_classes))
+    C_hat = np.zeros((num_classes, num_classes), dtype=np.float32)
+    # Build per-class mean over gold set
+    gold_labels_np = np.array(train_data_gold.train_labels) - num_classes
     for label in range(num_classes):
-        indices = np.arange(len(train_data_gold.train_labels))[
-            np.isclose(np.array(train_data_gold.train_labels) - num_classes, label)]
-        C_hat[label] = np.mean(probs[indices], axis=0, keepdims=True)
+        indices = np.arange(len(gold_labels_np))[np.isclose(gold_labels_np, label)]
+        if len(indices) > 0:
+            C_hat[label] = np.mean(probs[indices], axis=0, keepdims=True)
+        else:
+            # Fallback: uniform if no gold for this label (shouldn't happen)
+            C_hat[label] = np.ones((1, num_classes), dtype=np.float32) / num_classes
+    return C_hat.T  # transpose
 
-    return C_hat.T.astype(np.float32)
-
-C_hat_transpose = torch.from_numpy(get_C_hat_transpose())
-C_hat_transpose = V(C_hat_transpose.cuda(), requires_grad=False)
-
+C_hat_transpose = torch.from_numpy(get_C_hat_transpose()).to(device)  # (num_classes, num_classes)
 
 # /////// Resetting the network ////////
 state = {k: v for k, v in args._get_kwargs()}
@@ -324,71 +318,62 @@ state['learning_rate'] = state['init_learning_rate']
 for param_group in optimizer.param_groups:
     param_group['lr'] = state['learning_rate']
 
-model_name = os.path.join(
-    args.save,
-    args.dataset+'_'+str(args.gold_fraction) + str(args.corruption_prob) + args.corruption_type + '_init.pytorch')
-net.load_state_dict(torch.load(model_name))
+net.load_state_dict(torch.load(init_model_path, map_location=device))
 
-
-def train_phase2(C_hat_transpose):
-    net.train()     # enter train mode
+def train_phase2(C_hat_transpose: torch.Tensor):
+    net.train()
     loss_avg = 0.0
     for batch_idx, (data, target) in enumerate(train_all_loader):
-        # we subtract num_classes because we added num_classes to allow us to identify gold examples
-        data, target = data.numpy(), target.numpy()
+        # data: tensor (B,C,H,W), target: tensor of ints (B,)
+        data = data.to(device)
+        target = target.to(device)
 
         gold_indices = target > (num_classes - 1)
-        gold_len = np.sum(gold_indices)
-        if gold_len > 0:
-            data_g, target_g = data[gold_indices], target[gold_indices] - num_classes
-            data_g, target_g = V(torch.FloatTensor(data_g).cuda()),\
-                               V(torch.from_numpy(target_g).long().cuda())
-
         silver_indices = target < num_classes
-        silver_len = np.sum(silver_indices)
-        if silver_len > 0:
-            data_s, target_s = data[silver_indices], target[silver_indices]
-
-            data_s, target_s = V(torch.FloatTensor(data_s).cuda()),\
-                               V(torch.from_numpy(target_s).long().cuda())
+        gold_len = int(gold_indices.sum().item())
+        silver_len = int(silver_indices.sum().item())
 
         optimizer.zero_grad()
-        # forward
 
-        loss_s = 0
+        loss_s = torch.tensor(0.0, device=device)
         if silver_len > 0:
-            output_s = net(data_s)
-            pre1 = C_hat_transpose[torch.cuda.LongTensor(target_s.data)]
-            pre2 = torch.mul(F.softmax(output_s), pre1)
-            loss_s = -(torch.log(pre2.sum(1))).sum(0)
-        loss_g = 0
+            data_s = data[silver_indices]
+            target_s = target[silver_indices]
+            output_s = net(data_s)  # (bs, K)
+            # index rows of C_hat_transpose by target_s
+            pre1 = C_hat_transpose[target_s.long()]  # (bs, K)
+            pre2 = torch.mul(F.softmax(output_s, dim=1), pre1)  # (bs, K)
+            loss_s = -(torch.log(pre2.sum(1))).sum()  # scalar
+
+        loss_g = torch.tensor(0.0, device=device)
         if gold_len > 0:
+            data_g = data[gold_indices]
+            target_g = (target[gold_indices] - num_classes).long()
             output_g = net(data_g)
-            loss_g = F.cross_entropy(output_g, target_g, size_average=False)
+            loss_g = F.cross_entropy(output_g, target_g, reduction='sum')
 
         # backward
-        loss = (loss_g + loss_s)/args.batch_size
+        loss = (loss_g + loss_s) / args.batch_size
         loss.backward()
         optimizer.step()
 
         # exponential moving average
-        loss_avg = loss_avg * 0.2 + float(loss.cpu().data.numpy()[0]) * 0.8
+        loss_avg = loss_avg * 0.2 + loss.item() * 0.8
 
-        if args.nosgdr is False:    # Use a cyclic learning rate
-            dt = math.pi/float(args.epochs)
-            state['tt'] += float(dt)/(len(train_all_loader.dataset)/float(args.batch_size))
+        if not args.nosgdr:
+            dt = math.pi / float(args.epochs)
+            state['tt'] += float(dt) / (len(train_all_loader.dataset) / float(args.batch_size))
             if state['tt'] >= math.pi - 0.05:
                 state['tt'] = math.pi - 0.05
             curT = math.pi/2.0 + state['tt']
-            new_lr = args.learning_rate * (1.0 + math.sin(curT))/2.0    # lr_min = 0, lr_max = lr
+            new_lr = args.learning_rate * (1.0 + math.sin(curT)) / 2.0
             state['learning_rate'] = new_lr
             for param_group in optimizer.param_groups:
                 param_group['lr'] = state['learning_rate']
 
     state['train_loss'] = loss_avg
 
-
-# Main loop
+# Main loop phase 2
 for epoch in range(0, args.epochs):
     state['epoch'] = epoch
 
@@ -399,18 +384,13 @@ for epoch in range(0, args.epochs):
     test()
 
     # torch.save(net.state_dict(), os.path.join(args.save, args.dataset + '_model_epoch' + str(epoch) + '.pytorch'))
-    # Let us not waste space and delete the previous model
-    # We do not overwrite the model because we need the epoch number
-    # try: os.remove(os.path.join(args.save, args.dataset + '_model_epoch' + str(epoch-1) + '.pytorch'))
-    # except: True    # prodigious programming form
-
     log.write('%s\n' % json.dumps(state))
     log.flush()
     print(state)
 
 log.close()
 
-try: os.remove(os.path.join(
-    args.save,
-    args.dataset+'_'+str(args.gold_fraction) + str(args.corruption_prob) + args.corruption_type + '_init.pytorch'))
-except: True
+try:
+    os.remove(init_model_path)
+except Exception:
+    pass
