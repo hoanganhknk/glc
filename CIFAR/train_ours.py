@@ -9,7 +9,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torchvision.transforms as transforms
-import wideresnet as wrn
+import CIFAR.resnet as wrn
 import numpy as np
 from load_corrupted_data import CIFAR10, CIFAR100
 from PIL import Image
@@ -162,7 +162,8 @@ test_loader = torch.utils.data.DataLoader(
 os.makedirs(args.save, exist_ok=True)
 
 # Init model, criterion, and optimizer
-net = wrn.WideResNet(args.layers, num_classes, args.widen_factor, dropRate=args.droprate)
+from CIFAR.resnet import resnet32
+net = resnet32(num_classes=num_classes)
 print(net)
 
 if use_cuda and args.ngpu > 1:

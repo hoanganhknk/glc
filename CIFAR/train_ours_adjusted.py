@@ -11,7 +11,7 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
-import wideresnet as wrn
+import CIFAR.resnet as wrn
 import numpy as np
 from load_corrupted_data import CIFAR10, CIFAR100
 from PIL import Image
